@@ -175,3 +175,8 @@ docs/docs_skeleton/yarn.lock
 # Any new jupyter notebooks
 # not intended for the repo
 Untitled*.ipynb
+
+Chinook.db
+
+.vercel
+.turbo

@@ -1,4 +1,4 @@
-name: Check Links
+name: Check Docs & Links
 
 on:
   pull_request:
@@ -20,28 +20,30 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Check links in Markdown files
         uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          folder-path: "docs/"
+          check-modified-files-only: ${{ github.event_name != 'schedule' }}
+          file-path: "./README.md"
+          config-file: "./.markdown-link-check.config.json"
 
-  notebook-link-check:
+  check-readmes-synced:
+    # This checks that the repo README.md is identical to the libs/langgraph/README.md
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python 3.x + Poetry ${{ env.POETRY_VERSION }}
-        uses: "./.github/actions/poetry_setup"
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          python-version: "3.x"
-          poetry-version: ${{ env.POETRY_VERSION }}
-          cache-key: core
+          fetch-depth: 1
 
-      - name: Install dependencies
-        shell: bash
+      - name: Check README.md is in sync
         run: |
-          python -m pip install --upgrade pip
-          poetry install --with test
-          poetry pip install -U pytest pytest-check-links langsmith langchain GitPython
-      - name: Check links in notebooks
-        env:
-          LANGCHAIN_API_KEY: test
-          shell: bash
-          run: poetry run pytest -o python_files=non_python_only --check-links --ignore="*.py" -k .ipynb --check-links-ignore "https://(api|web)\.smith\.langchain\.com/.*" .
+            if ! diff -q README.md libs/langgraph/README.md >/dev/null; then
+            echo "README.md is out of sync with libs/langgraph/README.md"
+            diff -C 3 README.md libs/langgraph/README.md
+            exit 1
+            fi
