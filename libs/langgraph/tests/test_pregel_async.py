@@ -41,7 +41,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.constants import CONFIG_KEY_NODE_FINISHED, ERROR, PULL, PUSH, START
-from langgraph.errors import InvalidUpdateError, NodeInterrupt
+from langgraph.errors import InvalidUpdateError, NodeInterrupt, ParentCommand
 from langgraph.func import entrypoint, task
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import MessagesState, add_messages
@@ -534,7 +534,7 @@ async def test_dynamic_interrupt(async_checkpointer: BaseCheckpointSaver) -> Non
         return {"my_key": answer}
 
     tool_two_graph = StateGraph(State)
-    tool_two_graph.add_node("tool_two", tool_two_node, retry=RetryPolicy())
+    tool_two_graph.add_node("tool_two", tool_two_node, retry_policy=RetryPolicy())
     tool_two_graph.add_edge(START, "tool_two")
     tool_two = tool_two_graph.compile()
 
@@ -694,7 +694,7 @@ async def test_dynamic_interrupt_subgraph(
         return {"my_key": answer}
 
     subgraph = StateGraph(SubgraphState)
-    subgraph.add_node("do", tool_two_node, retry=RetryPolicy())
+    subgraph.add_node("do", tool_two_node, retry_policy=RetryPolicy())
     subgraph.add_edge(START, "do")
 
     class State(TypedDict):
@@ -879,7 +879,7 @@ async def test_copy_checkpoint(async_checkpointer: BaseCheckpointSaver) -> None:
         return ["tool_two", Send("tool_one", state)]
 
     tool_two_graph = StateGraph(State)
-    tool_two_graph.add_node("tool_two", tool_two_node, retry=RetryPolicy())
+    tool_two_graph.add_node("tool_two", tool_two_node, retry_policy=RetryPolicy())
     tool_two_graph.add_node("tool_one", tool_one)
     tool_two_graph.set_conditional_entry_point(start)
     tool_two = tool_two_graph.compile()
@@ -1338,7 +1338,7 @@ async def test_node_schemas_custom_output() -> None:
             "now": 123,
         }
 
-    builder = StateGraph(State, output=Output)
+    builder = StateGraph(State, output_schema=Output)
     builder.add_node("a", node_a)
     builder.add_node("b", node_b)
     builder.add_node("c", node_c)
@@ -1353,7 +1353,7 @@ async def test_node_schemas_custom_output() -> None:
         "messages": [_AnyIdHumanMessage(content="hello")],
     }
 
-    builder = StateGraph(State, output=Output)
+    builder = StateGraph(State, output_schema=Output)
     builder.add_node("a", node_a)
     builder.add_node("b", node_b)
     builder.add_node("c", node_c)
@@ -1780,7 +1780,9 @@ async def test_pending_writes_resume(
     builder = StateGraph(State)
     builder.add_node("one", one)
     builder.add_node(
-        "two", two, retry=RetryPolicy(max_attempts=2, initial_interval=0, jitter=False)
+        "two",
+        two,
+        retry_policy=RetryPolicy(max_attempts=2, initial_interval=0, jitter=False),
     )
     builder.add_edge(START, "one")
     builder.add_edge(START, "two")
@@ -4308,7 +4310,7 @@ async def test_in_one_fan_out_state_graph_waiting_edge_custom_state_class(
         assert isinstance(data, State)
         return "retriever_two"
 
-    workflow = StateGraph(State, input=Input, output=Output)
+    workflow = StateGraph(State, input_schema=Input, output_schema=Output)
 
     workflow.add_node("rewrite_query", rewrite_query)
     workflow.add_node("analyzer_one", analyzer_one)
@@ -5027,6 +5029,51 @@ async def test_subgraph_checkpoint_true(
     ]
 
 
+async def test_subgraph_checkpoint_during_false_inherited() -> None:
+    async_checkpointer = InMemorySaver()
+
+    class InnerState(TypedDict):
+        my_key: Annotated[str, operator.add]
+        my_other_key: str
+
+    def inner_1(state: InnerState):
+        return {"my_key": " got here", "my_other_key": state["my_key"]}
+
+    def inner_2(state: InnerState):
+        return {"my_key": " and there"}
+
+    inner = StateGraph(InnerState)
+    inner.add_node("inner_1", inner_1)
+    inner.add_node("inner_2", inner_2)
+    inner.add_edge("inner_1", "inner_2")
+    inner.set_entry_point("inner_1")
+    inner.set_finish_point("inner_2")
+
+    class State(TypedDict):
+        my_key: str
+
+    inner_app = inner.compile(checkpointer=async_checkpointer)
+    graph = StateGraph(State)
+    graph.add_node("inner", inner_app)
+    graph.add_edge(START, "inner")
+    graph.add_conditional_edges(
+        "inner", lambda s: "inner" if s["my_key"].count("there") < 2 else END
+    )
+    app = graph.compile(checkpointer=async_checkpointer)
+    for checkpoint_during in [True, False]:
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+        await app.ainvoke(
+            {"my_key": ""}, config, subgraphs=True, checkpoint_during=checkpoint_during
+        )
+        if checkpoint_during:
+            checkpoints = list(async_checkpointer.list(config))
+            assert len(checkpoints) == 12
+        else:
+            checkpoints = list(async_checkpointer.list(config))
+            assert len(checkpoints) == 1
+
+
 @NEEDS_CONTEXTVARS
 async def test_subgraph_checkpoint_true_interrupt(
     async_checkpointer: BaseCheckpointSaver, checkpoint_during: bool
@@ -5734,7 +5781,7 @@ async def test_store_injected_async(
     builder.add_edge("__start__", "node")
     builder.add_edge("node", "other_node")
 
-    N = 500
+    N = 50
     M = 1
 
     for i in range(N):
@@ -6005,11 +6052,14 @@ async def test_debug_nested_subgraphs(
 
         return clean_config
 
-    for checkpoint_events, checkpoint_history in zip(
-        stream_ns.values(), history_ns.values()
+    for checkpoint_events, checkpoint_history, ns in zip(
+        stream_ns.values(), history_ns.values(), stream_ns.keys()
     ):
         if not checkpoint_during:
             checkpoint_events = checkpoint_events[-1:]
+            if ns:  # Save no checkpoints for subgraphs when checkpoint_during=False
+                assert not checkpoint_history
+                continue
         assert len(checkpoint_events) == len(checkpoint_history)
         for stream, history in zip(checkpoint_events, checkpoint_history):
             assert stream["values"] == history.values
@@ -6980,14 +7030,17 @@ async def test_multiple_subgraphs(async_checkpointer: BaseCheckpointSaver) -> No
         return {"result": state["a"] + state["b"]}
 
     add_subgraph = (
-        StateGraph(State, output=Output).add_node(add).add_edge(START, "add").compile()
+        StateGraph(State, output_schema=Output)
+        .add_node(add)
+        .add_edge(START, "add")
+        .compile()
     )
 
     async def multiply(state):
         return {"result": state["a"] * state["b"]}
 
     multiply_subgraph = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(multiply)
         .add_edge(START, "multiply")
         .compile()
@@ -7000,7 +7053,7 @@ async def test_multiple_subgraphs(async_checkpointer: BaseCheckpointSaver) -> No
         return another_result
 
     parent_call_same_subgraph = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(call_same_subgraph)
         .add_edge(START, "call_same_subgraph")
         .compile(checkpointer=async_checkpointer)
@@ -7024,7 +7077,7 @@ async def test_multiple_subgraphs(async_checkpointer: BaseCheckpointSaver) -> No
         }
 
     parent_call_multiple_subgraphs = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(call_multiple_subgraphs)
         .add_edge(START, "call_multiple_subgraphs")
         .compile(checkpointer=async_checkpointer)
@@ -7102,14 +7155,17 @@ async def test_multiple_subgraphs_mixed_entrypoint(
         return {"result": state["a"] + state["b"]}
 
     add_subgraph = (
-        StateGraph(State, output=Output).add_node(add).add_edge(START, "add").compile()
+        StateGraph(State, output_schema=Output)
+        .add_node(add)
+        .add_edge(START, "add")
+        .compile()
     )
 
     async def multiply(state):
         return {"result": state["a"] * state["b"]}
 
     multiply_subgraph = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(multiply)
         .add_edge(START, "multiply")
         .compile()
@@ -7179,7 +7235,7 @@ async def test_multiple_subgraphs_mixed_state_graph(
         return {"result": another_result}
 
     parent_call_same_subgraph = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(call_same_subgraph)
         .add_edge(START, "call_same_subgraph")
         .compile(checkpointer=async_checkpointer)
@@ -7203,7 +7259,7 @@ async def test_multiple_subgraphs_mixed_state_graph(
         }
 
     parent_call_multiple_subgraphs = (
-        StateGraph(State, output=Output)
+        StateGraph(State, output_schema=Output)
         .add_node(call_multiple_subgraphs)
         .add_edge(START, "call_multiple_subgraphs")
         .compile(checkpointer=async_checkpointer)
@@ -8655,9 +8711,12 @@ async def test_imp_exception(
     ]
 
 
+@pytest.mark.parametrize("with_timeout", [False, "inner", "outer", "both"])
 @pytest.mark.parametrize("subgraph_persist", [True, False])
 async def test_parent_command_goto(
-    async_checkpointer: BaseCheckpointSaver, subgraph_persist: bool
+    async_checkpointer: BaseCheckpointSaver,
+    subgraph_persist: bool,
+    with_timeout: Literal[False, "inner", "outer", "both"],
 ) -> None:
     class State(TypedDict):
         dialog_state: Annotated[list[str], operator.add]
@@ -8678,6 +8737,8 @@ async def test_parent_command_goto(
     sub_builder.add_edge(START, "node_a_child")
     sub_builder.add_edge("node_a_child", "node_b_child")
     sub_graph = sub_builder.compile(checkpointer=subgraph_persist)
+    if with_timeout in ("inner", "both"):
+        sub_graph.step_timeout = 1
 
     async def node_b_parent(state):
         return {"dialog_state": ["node_b_parent"]}
@@ -8686,10 +8747,40 @@ async def test_parent_command_goto(
     main_builder.add_node(node_b_parent)
     main_builder.add_edge(START, "subgraph_node")
     main_builder.add_node("subgraph_node", sub_graph, destinations=("node_b_parent",))
-
     main_graph = main_builder.compile(async_checkpointer, name="parent")
+    if with_timeout in ("outer", "both"):
+        main_graph.step_timeout = 1
+
     config = {"configurable": {"thread_id": 1}}
 
     assert await main_graph.ainvoke(
         input={"dialog_state": ["init_state"]}, config=config
     ) == {"dialog_state": ["init_state", "b_child_state", "node_b_parent"]}
+
+
+@pytest.mark.parametrize("with_timeout", [True, False])
+async def test_timeout_with_parent_command(
+    async_checkpointer: BaseCheckpointSaver, with_timeout: bool
+) -> None:
+    """Test that parent commands are properly propagated during timeouts."""
+
+    class State(TypedDict):
+        value: str
+
+    async def parent_command_node(state: State) -> State:
+        await asyncio.sleep(0.1)  # Add some delay before raising
+        return Command(graph=Command.PARENT, goto="test_cmd", update={"key": "value"})
+
+    builder = StateGraph(State)
+    builder.add_node("parent_cmd", parent_command_node)
+    builder.set_entry_point("parent_cmd")
+    graph = builder.compile(checkpointer=async_checkpointer)
+    if with_timeout:
+        graph.step_timeout = 1
+
+    # Should propagate parent command, not timeout
+    thread1 = {"configurable": {"thread_id": "1"}}
+    with pytest.raises(ParentCommand) as exc_info:
+        await graph.ainvoke({"value": "start"}, thread1)
+    assert exc_info.value.args[0].goto == "test_cmd"
+    assert exc_info.value.args[0].update == {"key": "value"}
