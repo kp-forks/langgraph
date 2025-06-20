@@ -32,7 +32,6 @@ from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     Checkpoint,
     CheckpointTuple,
-    copy_checkpoint,
 )
 from langgraph.config import get_config
 from langgraph.constants import (
@@ -60,7 +59,6 @@ from langgraph.constants import (
     NS_SEP,
     NULL_TASK_ID,
     PUSH,
-    SCHEDULED,
     TASKS,
 )
 from langgraph.errors import (
@@ -80,6 +78,7 @@ from langgraph.pregel.algo import (
 from langgraph.pregel.call import identifier
 from langgraph.pregel.checkpoint import (
     channels_from_checkpoint,
+    copy_checkpoint,
     create_checkpoint,
     empty_checkpoint,
 )
@@ -107,7 +106,7 @@ from langgraph.types import (
     StreamChunk,
     StreamMode,
 )
-from langgraph.typing import InputT
+from langgraph.typing import InputT, OutputT, StateT
 from langgraph.utils.config import (
     ensure_config,
     merge_configs,
@@ -141,40 +140,38 @@ class NodeBuilder:
         "_metadata",
         "_writes",
         "_bound",
-        "_retries",
-        "_cache",
+        "_retry_policy",
+        "_cache_policy",
     )
 
-    _channels: list[str] | dict[str, str]
+    _channels: str | list[str]
     _triggers: list[str]
     _tags: list[str]
     _metadata: dict[str, Any]
     _writes: list[ChannelWriteEntry]
     _bound: Runnable
-    _retries: list[RetryPolicy]
-    _cache: CachePolicy | None
+    _retry_policy: list[RetryPolicy]
+    _cache_policy: CachePolicy | None
 
     def __init__(
         self,
     ) -> None:
-        self._channels = {}
+        self._channels = []
         self._triggers = []
         self._tags = []
         self._metadata = {}
         self._writes = []
         self._bound = DEFAULT_BOUND
-        self._retries = []
-        self._cache = None
+        self._retry_policy = []
+        self._cache_policy = None
 
     def subscribe_only(
         self,
         channel: str,
     ) -> Self:
         """Subscribe to a single channel."""
-        if isinstance(self._channels, list):
-            self._channels.append(channel)
-        elif not self._channels:
-            self._channels = [channel]
+        if not self._channels:
+            self._channels = channel
         else:
             raise ValueError(
                 "Cannot subscribe to single channels when other channels are already subscribed to"
@@ -200,15 +197,15 @@ class NodeBuilder:
         Returns:
             Self for chaining
         """
-        if isinstance(self._channels, list):
+        if isinstance(self._channels, str):
             raise ValueError(
                 "Cannot subscribe to channels when subscribed to a single channel"
             )
         if read:
             if not self._channels:
-                self._channels = {chan: chan for chan in channels}
+                self._channels = list(channels)
             else:
-                self._channels.update({chan: chan for chan in channels})
+                self._channels.extend(channels)
 
         if isinstance(channels, str):
             self._triggers.append(channels)
@@ -222,11 +219,10 @@ class NodeBuilder:
         *channels: str,
     ) -> Self:
         """Adds the specified channels to read from, without subscribing to them."""
-        assert self._channels, "Channels must be specified first"
-        assert isinstance(self._channels, dict), (
+        assert isinstance(self._channels, list), (
             "Cannot read additional channels when subscribed to single channels"
         )
-        self._channels.update({c: c for c in channels})
+        self._channels.extend(channels)
         return self
 
     def do(
@@ -274,14 +270,14 @@ class NodeBuilder:
         self._metadata.update(metadata)
         return self
 
-    def retry(self, *policies: RetryPolicy) -> Self:
+    def add_retry_policies(self, *policies: RetryPolicy) -> Self:
         """Adds retry policies to the node."""
-        self._retries.extend(policies)
+        self._retry_policy.extend(policies)
         return self
 
-    def cache(self, policy: CachePolicy) -> Self:
+    def add_cache_policy(self, policy: CachePolicy) -> Self:
         """Adds cache policies to the node."""
-        self._cache = policy
+        self._cache_policy = policy
         return self
 
     def build(self) -> PregelNode:
@@ -293,12 +289,12 @@ class NodeBuilder:
             metadata=self._metadata,
             writers=[ChannelWrite(self._writes)],
             bound=self._bound,
-            retry_policy=self._retries,
-            cache_policy=self._cache,
+            retry_policy=self._retry_policy,
+            cache_policy=self._cache_policy,
         )
 
 
-class Pregel(PregelProtocol[InputT], Generic[InputT]):
+class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, OutputT]):
     """Pregel manages the runtime behavior for LangGraph applications.
 
     ## Overview
@@ -593,8 +589,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
 
     config_type: type[Any] | None = None
 
-    input_model: type[BaseModel] | None = None
-
     config: RunnableConfig | None = None
 
     name: str = "LangGraph"
@@ -622,7 +616,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
         retry_policy: RetryPolicy | Sequence[RetryPolicy] = (),
         cache_policy: CachePolicy | None = None,
         config_type: type[Any] | None = None,
-        input_model: type[BaseModel] | None = None,
         config: RunnableConfig | None = None,
         trigger_to_nodes: Mapping[str, Sequence[str]] | None = None,
         name: str = "LangGraph",
@@ -654,7 +647,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
         )
         self.cache_policy = cache_policy
         self.config_type = config_type
-        self.input_model = input_model
         self.config = config
         self.trigger_to_nodes = trigger_to_nodes or {}
         self.name = name
@@ -753,6 +745,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
         validate_graph(
             self.nodes,
             {k: v for k, v in self.channels.items() if isinstance(v, BaseChannel)},
+            {k: v for k, v in self.channels.items() if not isinstance(v, BaseChannel)},
             self.input_channels,
             self.output_channels,
             self.stream_channels,
@@ -791,8 +784,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 return channel.UpdateType
 
     def get_input_schema(self, config: RunnableConfig | None = None) -> type[BaseModel]:
-        if self.input_model is not None:
-            return self.input_model
         config = merge_configs(self.config, config)
         if isinstance(self.input_channels, str):
             return super().get_input_schema(config)
@@ -917,7 +908,12 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
 
     def _migrate_checkpoint(self, checkpoint: Checkpoint) -> None:
         """Migrate a saved checkpoint to new channel layout."""
-        pass
+        if checkpoint["v"] < 4 and checkpoint.get("pending_sends"):
+            pending_sends: list[Send] = checkpoint.pop("pending_sends")
+            checkpoint["channel_values"][TASKS] = pending_sends
+            checkpoint["channel_versions"][TASKS] = max(
+                checkpoint["channel_versions"].values()
+            )
 
     def _prepare_state_snapshot(
         self,
@@ -1011,7 +1007,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
             )
         if apply_pending_writes and saved.pending_writes:
             for tid, k, v in saved.pending_writes:
-                if k in (ERROR, INTERRUPT, SCHEDULED):
+                if k in (ERROR, INTERRUPT):
                     continue
                 if tid not in next_tasks:
                     continue
@@ -1130,7 +1126,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
             )
         if apply_pending_writes and saved.pending_writes:
             for tid, k, v in saved.pending_writes:
-                if k in (ERROR, INTERRUPT, SCHEDULED):
+                if k in (ERROR, INTERRUPT):
                     continue
                 if tid not in next_tasks:
                     continue
@@ -1419,10 +1415,8 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     )
                 },
             )
-            checkpoint_metadata = config["metadata"]
             if saved:
                 checkpoint_config = patch_configurable(config, saved.config[CONF])
-                checkpoint_metadata = {**saved.metadata, **checkpoint_metadata}
             channels, managed = channels_from_checkpoint(
                 self.channels,
                 checkpoint,
@@ -1469,7 +1463,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         )
                     # apply writes from tasks that already ran
                     for tid, k, v in saved.pending_writes or []:
-                        if k in (ERROR, INTERRUPT, SCHEDULED):
+                        if k in (ERROR, INTERRUPT):
                             continue
                         if tid not in next_tasks:
                             continue
@@ -1487,7 +1481,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     checkpoint_config,
                     create_checkpoint(checkpoint, None, step),
                     {
-                        **checkpoint_metadata,
                         "source": "update",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1510,7 +1503,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     checkpoint_config,
                     next_checkpoint,
                     {
-                        **checkpoint_metadata,
                         "source": "update",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1547,9 +1539,11 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         checkpoint_config,
                         create_checkpoint(checkpoint, channels, next_step),
                         {
-                            **checkpoint_metadata,
                             "source": "input",
                             "step": next_step,
+                            "parents": saved.metadata.get("parents", {})
+                            if saved
+                            else {},
                         },
                         get_new_channel_versions(
                             checkpoint_previous_versions,
@@ -1585,7 +1579,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     saved.parent_config or saved.config if saved else checkpoint_config,
                     next_checkpoint,
                     {
-                        **checkpoint_metadata,
                         "source": "fork",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1633,7 +1626,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     )
                 # apply writes
                 for tid, k, v in saved.pending_writes:
-                    if k in (ERROR, INTERRUPT, SCHEDULED):
+                    if k in (ERROR, INTERRUPT):
                         continue
                     if tid not in next_tasks:
                         continue
@@ -1747,7 +1740,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 checkpoint_config,
                 checkpoint,
                 {
-                    **checkpoint_metadata,
                     "source": "update",
                     "step": step + 1,
                     "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1841,10 +1833,8 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     )
                 },
             )
-            checkpoint_metadata = config["metadata"]
             if saved:
                 checkpoint_config = patch_configurable(config, saved.config[CONF])
-                checkpoint_metadata = {**saved.metadata, **checkpoint_metadata}
             channels, managed = channels_from_checkpoint(
                 self.channels,
                 checkpoint,
@@ -1889,7 +1879,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         )
                     # apply writes from tasks that already ran
                     for tid, k, v in saved.pending_writes or []:
-                        if k in (ERROR, INTERRUPT, SCHEDULED):
+                        if k in (ERROR, INTERRUPT):
                             continue
                         if tid not in next_tasks:
                             continue
@@ -1907,7 +1897,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     checkpoint_config,
                     create_checkpoint(checkpoint, None, step),
                     {
-                        **checkpoint_metadata,
                         "source": "update",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1930,7 +1919,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     checkpoint_config,
                     next_checkpoint,
                     {
-                        **checkpoint_metadata,
                         "source": "update",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -1967,9 +1955,11 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         checkpoint_config,
                         create_checkpoint(checkpoint, channels, next_step),
                         {
-                            **checkpoint_metadata,
                             "source": "input",
                             "step": next_step,
+                            "parents": saved.metadata.get("parents", {})
+                            if saved
+                            else {},
                         },
                         get_new_channel_versions(
                             checkpoint_previous_versions,
@@ -2005,7 +1995,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     saved.parent_config or saved.config if saved else checkpoint_config,
                     next_checkpoint,
                     {
-                        **checkpoint_metadata,
                         "source": "fork",
                         "step": step + 1,
                         "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -2052,7 +2041,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         self.trigger_to_nodes,
                     )
                 for tid, k, v in saved.pending_writes:
-                    if k in (ERROR, INTERRUPT, SCHEDULED):
+                    if k in (ERROR, INTERRUPT):
                         continue
                     if tid not in next_tasks:
                         continue
@@ -2165,7 +2154,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 checkpoint_config,
                 checkpoint,
                 {
-                    **checkpoint_metadata,
                     "source": "update",
                     "step": step + 1,
                     "parents": saved.metadata.get("parents", {}) if saved else {},
@@ -2307,7 +2295,8 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 - `"custom"`: Emit custom data from inside nodes or tasks using `StreamWriter`.
                 - `"messages"`: Emit LLM messages token-by-token together with metadata for any LLM invocations inside nodes or tasks.
                     Will be emitted as 2-tuples `(LLM token, metadata)`.
-                - `"debug"`: Emit debug events with as much information as possible for each step.
+                - `"checkpoints"`: Emit an event when a checkpoint is created, in the same format as returned by get_state().
+                - `"tasks"`: Emit events when tasks start and finish, including their results and errors.
 
                 You can pass a list as the `stream_mode` parameter to stream multiple modes at once.
                 The streamed outputs will be tuples of `(mode, data)`.
@@ -2407,7 +2396,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 config[CONF][CONFIG_KEY_CHECKPOINT_DURING] = checkpoint_during
             with SyncPregelLoop(
                 input,
-                input_model=self.input_model,
                 stream=StreamProtocol(stream.put, stream_modes),
                 config=config,
                 store=store,
@@ -2416,6 +2404,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 nodes=self.nodes,
                 specs=self.channels,
                 output_keys=output_keys,
+                input_keys=self.input_channels,
                 stream_keys=self.stream_channels_asis,
                 interrupt_before=interrupt_before_,
                 interrupt_after=interrupt_after_,
@@ -2470,7 +2459,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 # Channel updates from step N are only visible in step N+1
                 # channels are guaranteed to be immutable for the duration of the step,
                 # with channel updates applied only at the transition between steps.
-                while loop.tick(input_keys=self.input_channels):
+                while loop.tick():
                     for task in loop.match_cached_writes():
                         loop.output_writes(task.id, task.writes, cached=True)
                     for _ in runner.tick(
@@ -2481,6 +2470,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                     ):
                         # emit output
                         yield from output()
+                    loop.after_tick()
             # emit output
             yield from output()
             # handle exit
@@ -2650,7 +2640,6 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 config[CONF][CONFIG_KEY_CHECKPOINT_DURING] = checkpoint_during
             async with AsyncPregelLoop(
                 input,
-                input_model=self.input_model,
                 stream=StreamProtocol(stream.put_nowait, stream_modes),
                 config=config,
                 store=store,
@@ -2659,6 +2648,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 nodes=self.nodes,
                 specs=self.channels,
                 output_keys=output_keys,
+                input_keys=self.input_channels,
                 stream_keys=self.stream_channels_asis,
                 interrupt_before=interrupt_before_,
                 interrupt_after=interrupt_after_,
@@ -2704,7 +2694,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                 # channel updates from step N are only visible in step N+1
                 # channels are guaranteed to be immutable for the duration of the step,
                 # with channel updates applied only at the transition between steps
-                while loop.tick(input_keys=self.input_channels):
+                while loop.tick():
                     for task in await loop.amatch_cached_writes():
                         loop.output_writes(task.id, task.writes, cached=True)
                     async for _ in runner.atick(
@@ -2716,6 +2706,7 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
                         # emit output
                         for o in output():
                             yield o
+                    loop.after_tick()
             # emit output
             for o in output():
                 yield o
@@ -2766,8 +2757,8 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
         """
         output_keys = output_keys if output_keys is not None else self.output_channels
 
-        latest: Union[dict[str, Any], Any] = None
-        chunks: list[Union[dict[str, Any], Any]] = []
+        latest: dict[str, Any] | Any = None
+        chunks: list[dict[str, Any] | Any] = []
         interrupts: list[Interrupt] = []
 
         for chunk in self.stream(
@@ -2833,8 +2824,8 @@ class Pregel(PregelProtocol[InputT], Generic[InputT]):
 
         output_keys = output_keys if output_keys is not None else self.output_channels
 
-        latest: Union[dict[str, Any], Any] = None
-        chunks: list[Union[dict[str, Any], Any]] = []
+        latest: dict[str, Any] | Any = None
+        chunks: list[dict[str, Any] | Any] = []
         interrupts: list[Interrupt] = []
 
         async for chunk in self.astream(
